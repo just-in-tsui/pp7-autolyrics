@@ -25,6 +25,9 @@ venv/
 ENV/
 optVenv/
 Archive/
+optVenv311/
+Qwen_Local/
+.gemini
 
 # Models and Large Files
 *.onnx
@@ -36,3 +39,5 @@ sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
 .AppleDouble
 .LSOverride
 Icon
+
+Meeting_Transcriber.py

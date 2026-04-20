@@ -10,13 +10,34 @@ import sys
 import os
 import signal
 import opencc
+import logging
+from datetime import datetime
 from pynput import keyboard
+
+# ================= PERFORMANCE LOGGING SETUP =================
+log_filename = f"performance_{datetime.now().strftime('%Y-%m-%d')}.log"
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Global metrics for exit summary
+perf_metrics = {
+    'audio_latency_sum': 0.0,
+    'audio_latency_count': 0,
+    'fuzzy_latency_sum': 0.0,
+    'fuzzy_latency_count': 0,
+    'api_latency_sum': 0.0,
+    'api_latency_count': 0
+}
+# =============================================================
 
 # ================= CONFIGURATION =================
 PP_HOST = "127.0.0.1"
 PP_PORT = 1025          
-EN_THRESHOLD = 55  # 65 when plugged in 
-CN_THRESHOLD = 45 # 55 when plugged in 
+EN_THRESHOLD = 65  # 65 when plugged in 
+CN_THRESHOLD = 55 # 55 when plugged in 
 MODEL_DIR_SV = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
 
 # ---------------- HOTKEY CONFIGURATION ----------------
@@ -36,6 +57,27 @@ cc = opencc.OpenCC('s2t.json')
 
 def force_quit(sig, frame):
     print("\n\n🛑 Force terminating the script...")
+    print("\n📊 --- Performance Session Summary ---")
+    
+    if perf_metrics['audio_latency_count'] > 0:
+        avg_audio = perf_metrics['audio_latency_sum'] / perf_metrics['audio_latency_count']
+        print(f"🎙️  Avg Audio-to-Text Latency: {avg_audio:.2f} ms")
+    else:
+        print("🎙️  Avg Audio-to-Text Latency: N/A")
+        
+    if perf_metrics['fuzzy_latency_count'] > 0:
+        avg_fuzzy = perf_metrics['fuzzy_latency_sum'] / perf_metrics['fuzzy_latency_count']
+        print(f"🧠 Avg Fuzzy Match Latency: {avg_fuzzy:.2f} ms")
+    else:
+        print("🧠 Avg Fuzzy Match Latency: N/A")
+        
+    if perf_metrics['api_latency_count'] > 0:
+        avg_api = perf_metrics['api_latency_sum'] / perf_metrics['api_latency_count']
+        print(f"🌐 Avg API Trigger Latency: {avg_api:.2f} ms")
+    else:
+        print("🌐 Avg API Trigger Latency: N/A")
+        
+    print("--------------------------------------\n")
     os._exit(0)
 signal.signal(signal.SIGINT, force_quit)
 
@@ -46,6 +88,7 @@ DOUBLE_PRESS_DELAY = 0.4
 
 # NEW: Global Pause State
 is_paused = False 
+is_slow_mode = False 
 
 def load_sensevoice_engine(target_language):
     if not os.path.exists(MODEL_DIR_SV):
@@ -111,12 +154,12 @@ class PP7SmartPoller:
             
             if len(chinese_chars) > 0:
                 self.is_chinese_slide = True
-                target = chinese_chars[-5:] if len(chinese_chars) > 5 else chinese_chars
+                target = chinese_chars[-10:] if len(chinese_chars) > 10 else chinese_chars
                 return target, self.current_index
             else:
                 self.is_chinese_slide = False
                 text = self.current_full_text
-                target = text[-25:] if len(text) > 25 else text
+                target = text[-35:] if len(text) > 35 else text
                 return target.strip(), self.current_index
 
     def update_loop(self):
@@ -207,7 +250,7 @@ def jump_to_group(group_name, immediate):
 
 # --- KEYBOARD LISTENER ---
 def on_press(key):
-    global cued_slide_index, is_paused
+    global cued_slide_index, is_paused, is_slow_mode
     try:
         if key == keyboard.Key.right: trigger_api("/v1/presentation/active/next/trigger", "➡️  === NEXT SLIDE ==="); return
         elif key == keyboard.Key.left: trigger_api("/v1/presentation/active/previous/trigger", "⬅️  === PREV SLIDE ==="); return
@@ -222,6 +265,16 @@ def on_press(key):
                 is_paused = not is_paused
                 state_msg = "⏸️  PAUSED" if is_paused else "▶️  RESUMED"
                 print(f"\n\n{state_msg} - Auto-lyrics are {'stopped' if is_paused else 'listening'}.\n")
+                return
+            
+            # --- FAST / SLOW SONG TOGGLE ---
+            if k == ',':
+                is_slow_mode = False
+                print(f"\n\n⏩ FAST SONG MODE - Using default thresholds and delays.\n")
+                return
+            if k == '.':
+                is_slow_mode = True
+                print(f"\n\n🐢 SLOW SONG MODE - Increased thresholds and longer delays.\n")
                 return
             
             if k in HOTKEYS:
@@ -241,29 +294,54 @@ def fast_smart_score(heard_text, target, is_chinese_slide):
     
     if is_chinese_slide:
         heard_cn = "".join(re.findall(r'[\u4e00-\u9FFF]', heard_clean))
-        if len(heard_cn) < 2: return 0, heard_cn # Ignore random single grunts
+        if len(heard_cn) < 2: return 0, heard_cn 
         heard_trad = cc.convert(heard_cn)
         
         score = fuzz.partial_ratio(target, heard_trad)
         
-        # DYNAMIC PENALTY: -6 points for every missing Chinese character
+        # --- THE ADVANCED REPETITION ENFORCER (CHINESE) ---
+        # Grab the last 4 characters to act as our "anchor" phrase
+        anchor_phrase = target[-4:] if len(target) >= 4 else target
+        target_reps = target.count(anchor_phrase)
+        heard_reps = heard_trad.count(anchor_phrase)
+        
+        # If the end of the slide is a repeated phrase, enforce the loop!
+        if target_reps > 1 and heard_reps < target_reps:
+            score -= 40  # Massive penalty: Singer is only on the first loop
+            
+        # Dynamic penalty: -6 points per missing Chinese character
         missing_chars = len(target) - len(heard_trad)
         if missing_chars > 0:
             score -= (missing_chars * 6)
             
         return score, heard_trad
-    else:
-        if len(heard_clean) < 5: return 0, heard_clean # Force it to hear at least 1 full word
-        score = fuzz.partial_ratio(target.lower(), heard_clean.lower())
         
-        # DYNAMIC PENALTY: -2 points for every missing English letter
-        missing_letters = len(target) - len(heard_clean)
+    else:
+        if len(heard_clean) < 5: return 0, heard_clean 
+        
+        clean_target = re.sub(r'[^\w\s]', '', target.lower())
+        clean_heard = re.sub(r'[^\w\s]', '', heard_clean.lower())
+        
+        score = fuzz.partial_ratio(clean_target, clean_heard)
+        
+        # --- THE ADVANCED REPETITION ENFORCER (ENGLISH) ---
+        target_words = clean_target.split()
+        if len(target_words) > 1:
+            anchor_word = target_words[-1]
+            target_reps = clean_target.count(anchor_word)
+            heard_reps = clean_heard.count(anchor_word)
+            
+            if target_reps > 1 and heard_reps < target_reps:
+                score -= 40  # Massive penalty
+                
+        # Dynamic penalty: -3 points per missing English letter
+        missing_letters = len(clean_target) - len(clean_heard)
         if missing_letters > 0:
-            score -= (missing_letters * 2)
+            score -= (missing_letters * 3)
             
         return score, heard_clean
 def main():
-    global poller, is_paused
+    global poller, is_paused, is_slow_mode
     p = pyaudio.PyAudio()
     
     print("\n🎤 Available Microphones:")
@@ -339,21 +417,29 @@ def main():
                     sys.stdout.write(f"\r👂 Heard [{lang_tag}]: {display_text:<40} | Match: {score}%   ")
                     sys.stdout.flush()
 
-                    threshold = CN_THRESHOLD if is_chinese else EN_THRESHOLD
+                    # Adjust thresholds for slow mode
+                    base_threshold = CN_THRESHOLD if is_chinese else EN_THRESHOLD
+                    threshold = base_threshold + 10 if is_slow_mode else base_threshold
                     
                     if score >= threshold:
                         # --- DYNAMIC DELAY LOGIC ---
                         missing_chars = max(0, len(target) - len(clean_heard))
                         if missing_chars > 0:
                             if is_chinese:
-                                # HEAVY PENALTY: 0.5s per missing Chinese character (up from 0.35s)
-                                # Cap increased to 2.5 seconds
-                                delay = min(missing_chars * 0.5, 3) 
+                                if is_slow_mode:
+                                    delay = min(missing_chars * 0.5, 3.5)
+                                else:
+                                    # HEAVY PENALTY: 0.5s per missing Chinese character (up from 0.35s)
+                                    # Cap increased to 2.5 seconds
+                                    delay = min(missing_chars * 0.3, 2.5) 
                                 unit = "chars"
                             else:
-                                # HEAVY PENALTY: 0.15s per missing English letter (approx 0.7s per word)
-                                # Cap increased to 2.5 seconds
-                                delay = min(missing_chars * 0.15, 2.5) 
+                                if is_slow_mode:
+                                    delay = min(missing_chars * 0.25, 4.0)
+                                else:
+                                    # HEAVY PENALTY: 0.15s per missing English letter (approx 0.7s per word)
+                                    # Cap increased to 2.5 seconds
+                                    delay = min(missing_chars * 0.15, 2.5) 
                                 unit = "letters"
                                 
                             sys.stdout.write(f"\r⏱️ Early match ({missing_chars} {unit} left)! Delaying {delay:.1f}s...      ")
