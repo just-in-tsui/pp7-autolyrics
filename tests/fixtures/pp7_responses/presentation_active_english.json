@@ -1,0 +1,20 @@
+{
+  "presentation": {
+    "groups": [
+      {
+        "name": "Verse 1",
+        "slides": [
+          {"text": "Amazing grace\r\nhow sweet the sound"},
+          {"text": "That saved a wretch like me"}
+        ]
+      },
+      {
+        "name": "Chorus 1",
+        "slides": [
+          {"text": "My chains are gone\r\nI've been set free"},
+          {"text": "My God my Saviour has ransomed me"}
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "description": "571 Generous Giver  Eng Chorus",
+  "slide_cache": [
+    {"text": "You are an endless fountain You're ﬁlling up my life", "group": "English Chorus 1"},
+    {"text": "My heart must sing Your praises Jesus You be gloriﬁed", "group": "English Verse 1"}
+  ],
+  "starting_slide_index": 0,
+  "expected_trigger_sec": 6.0,
+  "tolerance_sec": 0.5,
+  "no_false_positive_before_sec": 2.0
+}

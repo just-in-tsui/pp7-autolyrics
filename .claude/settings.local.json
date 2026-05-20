@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile PP7_SenseVoice_Only.py audio_pipeline.py)",
+      "Bash(/Users/kcc/Documents/Coding/PP7_AutoLyrics/optVenv/bin/python -m py_compile PP7_SenseVoice_Only.py audio_pipeline.py)",
+      "Bash(/Users/kcc/Documents/Coding/PP7_AutoLyrics/optVenv/bin/python *)",
+      "Bash(/Users/kcc/Documents/Coding/PP7_AutoLyrics/optVenv/bin/pip install *)",
+      "Bash(optVenv/bin/python -m pytest tests/test_fuzzy_score.py tests/test_target_extraction.py -v)",
+      "Bash(optVenv/bin/python -m pytest tests/test_poller.py -v)",
+      "Bash(optVenv/bin/python -m pytest tests/ -v)",
+      "Bash(optVenv/bin/python *)",
+      "Bash(ffprobe *)",
+      "Bash(ffmpeg -y -loglevel error -i cantonese_line.wav -ac 1 -ar 16000 -sample_fmt s16 cantonese_line.16k.wav)",
+      "Bash(ffmpeg -y -loglevel error -i english_line.wav -ac 1 -ar 16000 -sample_fmt s16 english_line.16k.wav)",
+      "Bash(ffmpeg -y -loglevel error -i \"Worship 26 - 2020.07.21.wav\" -ac 1 -ar 16000 -sample_fmt s16 chinese_repetition.wav)",
+      "Read(//tmp/**)",
+      "Bash(cp PP7_SenseVoice_Only.py /tmp/PP7_SenseVoice_Only.thinclient.bak)",
+      "Bash(git checkout *)"
+    ]
+  }
+}

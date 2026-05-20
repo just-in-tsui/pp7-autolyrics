@@ -1,0 +1,10 @@
+{
+  "description": "走祢道路 repeated ending (reverent 祢 + graduated penalty regression)",
+  "slide_cache": [
+    {"text": "走祢道路走祢道路", "group": "Chinese Verse 1"}
+  ],
+  "starting_slide_index": 0,
+  "expected_trigger_sec": 4.9,
+  "tolerance_sec": 0.5,
+  "no_false_positive_before_sec": 4.0
+}

@@ -1,0 +1,11 @@
+{
+  "description": "571 Generous Giver Slide 1",
+  "slide_cache": [
+    {"text": "是祢慷慨傾出厚愛   十架中祢張開兩手", "group": "Chinese Verse 1"},
+    {"text": "代價多少都不計較   我看到主祢", "group": "Chinese Verse 1"}
+  ],
+  "starting_slide_index": 0,
+  "expected_trigger_sec": 12.5,
+  "tolerance_sec": 0.5,
+  "no_false_positive_before_sec": 2.0
+}

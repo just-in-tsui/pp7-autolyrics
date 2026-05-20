@@ -45,9 +45,13 @@ This project acts as an intelligent bridge between a live microphone input and P
 ## Running the System
 1.  **ProPresenter Config:** Enable **Network** in Settings > Network (Port 1025, no password).
 2.  **Execution:**
+    You can run either the standard script or the performance-optimized version:
     ```bash
     python PP7_SenseVoice_Only.py
+    # OR
+    python PP7_SenseVoice_Optimized.py
     ```
+    *Note: The `Optimized` script includes Voice Activity Detection (VAD) and dynamic audio buffer sizing to drastically reduce CPU load and processing latency, preventing real-time lag.*
 3.  **Selection:** Choose the correct microphone index from the list provided on startup.
 
 ## Operational Controls
