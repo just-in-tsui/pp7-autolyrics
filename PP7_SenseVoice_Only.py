@@ -87,8 +87,10 @@ last_key_press = {}
 DOUBLE_PRESS_DELAY = 0.4
 
 # NEW: Global Pause State
-is_paused = False 
-is_slow_mode = False 
+is_paused = False
+is_slow_mode = False
+stop_at_section_end = False   # when True, auto-advance holds at section boundaries
+held_at_index = None          # slide we're currently holding on (suppresses repeat fires/messages) 
 
 def load_sensevoice_engine(target_language):
     if not os.path.exists(MODEL_DIR_SV):
@@ -201,7 +203,7 @@ def trigger_slide(index):
     except: pass
 
 def handle_lyric_trigger():
-    global cued_slide_index, poller
+    global cued_slide_index, poller, held_at_index
     is_end_of_section = False
     with poller.lock:
         current_idx = poller.current_index
@@ -213,6 +215,15 @@ def handle_lyric_trigger():
                     is_end_of_section = True
             else:
                 is_end_of_section = True
+
+    # Persistent hold-at-section-end. Overrides cued jumps. The held_at_index guard
+    # prevents the message/return from spamming every decode cycle while we sit on
+    # the last slide of the section.
+    if stop_at_section_end and is_end_of_section:
+        if held_at_index != current_idx:
+            held_at_index = current_idx
+            print(f"\n🛑 Holding at end of section (slide {current_idx}). Press → to continue.")
+        return
 
     if cued_slide_index is not None and is_end_of_section:
         print(f"\n🚀 Section Ended! Executing Cued Jump to Slide {cued_slide_index}...")
@@ -250,7 +261,7 @@ def jump_to_group(group_name, immediate):
 
 # --- KEYBOARD LISTENER ---
 def on_press(key):
-    global cued_slide_index, is_paused, is_slow_mode
+    global cued_slide_index, is_paused, is_slow_mode, stop_at_section_end, held_at_index
     try:
         if key == keyboard.Key.right: trigger_api("/v1/presentation/active/next/trigger", "➡️  === NEXT SLIDE ==="); return
         elif key == keyboard.Key.left: trigger_api("/v1/presentation/active/previous/trigger", "⬅️  === PREV SLIDE ==="); return
@@ -277,6 +288,23 @@ def on_press(key):
                 print(f"\n\n🐢 SLOW SONG MODE - Increased thresholds and longer delays.\n")
                 return
             
+            # --- CLEAR CUED JUMP ---
+            if k == "'":
+                cued_slide_index = None
+                print("\n\n🧹 Cleared cued section jump.\n")
+                return
+
+            # --- TOGGLE HOLD AT SECTION END ---
+            if k == ';':
+                stop_at_section_end = not stop_at_section_end
+                if not stop_at_section_end:
+                    held_at_index = None
+                msg = ("🛑 HOLD AT SECTION END: ON — auto-advance pauses at each section boundary."
+                       if stop_at_section_end else
+                       "▶️  HOLD AT SECTION END: OFF — auto-advance crosses sections normally.")
+                print(f"\n\n{msg}\n")
+                return
+
             if k in HOTKEYS:
                 now = time.time()
                 group_name = HOTKEYS[k]
@@ -360,7 +388,7 @@ def main():
     listener.start()
 
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, input_device_index=mic_idx, frames_per_buffer=2048)
-    print(f"\n✅ System Ready! Press '/' to pause/resume listening.")
+    print("\n✅ System Ready! '/' pause · ';' hold@section-end · ''' clear cued jump")
     
     current_slide = -1
     

@@ -15,7 +15,8 @@
       "Bash(ffmpeg -y -loglevel error -i \"Worship 26 - 2020.07.21.wav\" -ac 1 -ar 16000 -sample_fmt s16 chinese_repetition.wav)",
       "Read(//tmp/**)",
       "Bash(cp PP7_SenseVoice_Only.py /tmp/PP7_SenseVoice_Only.thinclient.bak)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash(python -m py_compile PP7_SenseVoice_Only.py)"
     ]
   }
 }
