@@ -9,10 +9,17 @@ import re
 import sys
 import os
 import signal
+import termios
 import opencc
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pynput import keyboard
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 # ================= PERFORMANCE LOGGING SETUP =================
 log_filename = f"performance_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -56,6 +63,12 @@ HOTKEYS = {
 cc = opencc.OpenCC('s2t.json')
 
 def force_quit(sig, frame):
+    try:
+        if live is not None:
+            live.stop()
+    except Exception:
+        pass
+    restore_terminal_echo()
     print("\n\n🛑 Force terminating the script...")
     print("\n📊 --- Performance Session Summary ---")
     
@@ -90,7 +103,57 @@ DOUBLE_PRESS_DELAY = 0.4
 is_paused = False
 is_slow_mode = False
 stop_at_section_end = False   # when True, auto-advance holds at section boundaries
-held_at_index = None          # slide we're currently holding on (suppresses repeat fires/messages) 
+held_at_index = None          # slide we're currently holding on (suppresses repeat fires/messages)
+
+
+@dataclass
+class UIState:
+    """Shared snapshot the rich dashboard renders. Background threads (keyboard
+    listener, poller) mutate fields here instead of printing — only the main loop
+    draws, so a fixed panel never gets corrupted by interleaved thread output."""
+    mic_name: str = "—"
+    input_level: float = 0.0          # latest chunk RMS (0..~0.3)
+    last_sound_ts: float = 0.0        # last time RMS crossed the audible floor
+    decode_ms: float = 0.0            # latest SenseVoice decode time
+    heard: str = ""                   # latest transcription tail
+    score: int | None = None          # latest match score
+    last_action: str = "Ready"        # most recent event (jump / trigger / toggle)
+
+
+ui = UIState()
+live = None  # the rich.Live handle, set in main(); force_quit stops it on SIGINT
+_saved_termios = None  # terminal attrs to restore on exit (echo on)
+
+
+def set_action(msg):
+    ui.last_action = msg
+
+
+def disable_terminal_echo():
+    """Suppress local terminal echo while the rich dashboard is active.
+    pynput's section-jump letters (and `' ; / , .`) would otherwise be echoed
+    to stdout when the terminal has focus, corrupting Live's cursor tracking
+    and causing the panel to redraw on a new line each keypress."""
+    global _saved_termios
+    try:
+        fd = sys.stdin.fileno()
+        _saved_termios = termios.tcgetattr(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.ECHO  # lflag
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        _saved_termios = None
+
+
+def restore_terminal_echo():
+    global _saved_termios
+    if _saved_termios is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _saved_termios)
+    except Exception:
+        pass
+    _saved_termios = None
 
 def load_sensevoice_engine(target_language):
     if not os.path.exists(MODEL_DIR_SV):
@@ -121,7 +184,8 @@ class PP7SmartPoller:
         self.current_index = -1
         self.current_uuid = None  
         self.slide_cache = []
-        self.is_chinese_slide = False 
+        self.is_chinese_slide = False
+        self.connected = False
 
     def fetch_full_song(self):
         try:
@@ -170,69 +234,78 @@ class PP7SmartPoller:
             try:
                 resp = self.session.get(f"{self.base_url}/presentation/slide_index", timeout=0.2)
                 if resp.status_code == 200:
+                    self.connected = True
                     idx, new_uuid = self.get_slide_info_smart(resp.json())
                     with self.lock:
                         if new_uuid and new_uuid != self.current_uuid:
                             self.current_uuid = new_uuid
                             self.fetch_full_song()
-                            last_index = -999 
-                            
+                            last_index = -999
+
                         if idx != last_index:
                             self.current_index = idx
                             if 0 <= idx < len(self.slide_cache):
                                 self.current_full_text = self.slide_cache[idx]["text"]
-                                target, _ = self.get_target()
-                                print(f"\n\n🎯 Slide {idx} [{self.slide_cache[idx]['group']}] Target: \"...{target}\"")
                             else:
                                 self.current_full_text = ""
                             last_index = idx
-            except: pass
+            except Exception:
+                self.connected = False
             time.sleep(0.15)
 
 # --- API TRIGGER FUNCTIONS ---
 def trigger_api(endpoint, message):
     try:
         requests.get(f"http://{PP_HOST}:{PP_PORT}{endpoint}")
-        print(f"\n{message}\n")
+        set_action(message)
     except: pass
 
 def trigger_slide(index):
     try:
         requests.get(f"http://{PP_HOST}:{PP_PORT}/v1/presentation/active/{index}/trigger")
-        print(f"\n🚀 === JUMPED TO SLIDE {index} ===\n")
+        set_action(f"Jumped to slide {index}")
     except: pass
 
-def handle_lyric_trigger():
-    global cued_slide_index, poller, held_at_index
-    is_end_of_section = False
+def is_end_of_section():
+    """True if the poller's current slide is the last one in its group (or the
+    final slide of the deck). Shared by the auto-trigger and the right-arrow
+    manual override so a cued section jump fires consistently at boundaries."""
+    if poller is None:
+        return False
     with poller.lock:
         current_idx = poller.current_index
         if 0 <= current_idx < len(poller.slide_cache):
             current_group = poller.slide_cache[current_idx]['group']
             next_idx = current_idx + 1
             if next_idx < len(poller.slide_cache):
-                if current_group != poller.slide_cache[next_idx]['group']:
-                    is_end_of_section = True
-            else:
-                is_end_of_section = True
+                return current_group != poller.slide_cache[next_idx]['group']
+            return True
+    return False
+
+
+def handle_lyric_trigger():
+    global cued_slide_index, poller, held_at_index
+    end_of_section = is_end_of_section()
+    with poller.lock:
+        current_idx = poller.current_index
 
     # Persistent hold-at-section-end. Overrides cued jumps. The held_at_index guard
     # prevents the message/return from spamming every decode cycle while we sit on
     # the last slide of the section.
-    if stop_at_section_end and is_end_of_section:
+    if stop_at_section_end and end_of_section:
         if held_at_index != current_idx:
             held_at_index = current_idx
-            print(f"\n🛑 Holding at end of section (slide {current_idx}). Press → to continue.")
+            set_action(f"Holding at end of section (slide {current_idx}) — press → to continue")
         return
 
-    if cued_slide_index is not None and is_end_of_section:
-        print(f"\n🚀 Section Ended! Executing Cued Jump to Slide {cued_slide_index}...")
+    if cued_slide_index is not None and end_of_section:
         trigger_slide(cued_slide_index)
-        cued_slide_index = None 
+        set_action(f"Section ended — executed cued jump to slide {cued_slide_index}")
+        cued_slide_index = None
     else:
         try:
             requests.get(f"http://{PP_HOST}:{PP_PORT}/v1/presentation/active/next/trigger")
-            print("\n🚀 === TRIGGERED NEXT ===\n")
+            set_action("Triggered next slide")
         except: pass
 
 def jump_to_group(group_name, immediate):
@@ -252,46 +325,58 @@ def jump_to_group(group_name, immediate):
                 
     if target_idx != -1:
         if immediate:
-            print(f"\n⚡ Double Press! Jumping instantly to: {group_name} (Slide {target_idx})")
             trigger_slide(target_idx)
+            set_action(f"Jumped now to {group_name} (slide {target_idx})")
             cued_slide_index = None
         else:
-            print(f"\n📌 Cued next section: {group_name} (Slide {target_idx}). Will jump after current section ends.")
             cued_slide_index = target_idx
+            set_action(f"Cued {group_name} (slide {target_idx}) — jumps after this section")
 
 # --- KEYBOARD LISTENER ---
 def on_press(key):
     global cued_slide_index, is_paused, is_slow_mode, stop_at_section_end, held_at_index
     try:
-        if key == keyboard.Key.right: trigger_api("/v1/presentation/active/next/trigger", "➡️  === NEXT SLIDE ==="); return
-        elif key == keyboard.Key.left: trigger_api("/v1/presentation/active/previous/trigger", "⬅️  === PREV SLIDE ==="); return
-        elif key == keyboard.Key.down: trigger_api("/v1/playlist/active/next/trigger", "⬇️  === NEXT SONG ==="); return
-        elif key == keyboard.Key.up: trigger_api("/v1/playlist/active/previous/trigger", "⬆️  === PREV SONG ==="); return
+        if key == keyboard.Key.right:
+            # Manual override at section boundaries: if we're on the last slide of
+            # the current section AND a cue is set, → fires the cued jump (same
+            # behavior as automation, just operator-initiated). Mid-section, → is
+            # always a normal next-slide so the cue stays parked.
+            if cued_slide_index is not None and is_end_of_section():
+                idx = cued_slide_index
+                group = poller.slide_cache[idx]['group'] if poller and 0 <= idx < len(poller.slide_cache) else "?"
+                trigger_slide(idx)
+                cued_slide_index = None
+                set_action(f"Manual → fired cued jump to {group} (slide {idx})")
+            else:
+                trigger_api("/v1/presentation/active/next/trigger", "Next slide")
+            return
+        elif key == keyboard.Key.left: trigger_api("/v1/presentation/active/previous/trigger", "Previous slide"); return
+        elif key == keyboard.Key.down: trigger_api("/v1/playlist/active/next/trigger", "Next song"); return
+        elif key == keyboard.Key.up: trigger_api("/v1/playlist/active/previous/trigger", "Previous song"); return
 
         if hasattr(key, 'char') and key.char:
             k = key.char.lower()
-            
+
             # --- START / PAUSE TOGGLE ---
             if k == '/':
                 is_paused = not is_paused
-                state_msg = "⏸️  PAUSED" if is_paused else "▶️  RESUMED"
-                print(f"\n\n{state_msg} - Auto-lyrics are {'stopped' if is_paused else 'listening'}.\n")
+                set_action("Paused — not listening" if is_paused else "Resumed — listening")
                 return
-            
+
             # --- FAST / SLOW SONG TOGGLE ---
             if k == ',':
                 is_slow_mode = False
-                print(f"\n\n⏩ FAST SONG MODE - Using default thresholds and delays.\n")
+                set_action("Fast song mode")
                 return
             if k == '.':
                 is_slow_mode = True
-                print(f"\n\n🐢 SLOW SONG MODE - Increased thresholds and longer delays.\n")
+                set_action("Slow song mode")
                 return
-            
+
             # --- CLEAR CUED JUMP ---
             if k == "'":
                 cued_slide_index = None
-                print("\n\n🧹 Cleared cued section jump.\n")
+                set_action("Cleared cued section jump")
                 return
 
             # --- TOGGLE HOLD AT SECTION END ---
@@ -299,10 +384,8 @@ def on_press(key):
                 stop_at_section_end = not stop_at_section_end
                 if not stop_at_section_end:
                     held_at_index = None
-                msg = ("🛑 HOLD AT SECTION END: ON — auto-advance pauses at each section boundary."
-                       if stop_at_section_end else
-                       "▶️  HOLD AT SECTION END: OFF — auto-advance crosses sections normally.")
-                print(f"\n\n{msg}\n")
+                set_action("Hold at section end: ON" if stop_at_section_end
+                           else "Hold at section end: OFF")
                 return
 
             if k in HOTKEYS:
@@ -366,19 +449,150 @@ def fast_smart_score(heard_text, target, is_chinese_slide):
         missing_letters = len(clean_target) - len(clean_heard)
         if missing_letters > 0:
             score -= (missing_letters * 3)
-            
+
         return score, heard_clean
+
+
+def target_has_repeat(target, is_chinese_slide):
+    """Does the slide's target end in a repeated phrase? If so we must decode the
+    full buffer so the repetition enforcer can count loops; otherwise the shorter,
+    faster decode window is safe."""
+    if not target:
+        return False
+    if is_chinese_slide:
+        anchor = target[-4:] if len(target) >= 4 else target
+        return target.count(anchor) > 1
+    clean = re.sub(r'[^\w\s]', '', target.lower())
+    words = clean.split()
+    if len(words) > 1:
+        return clean.count(words[-1]) > 1
+    return False
+
+
+def short_target(target, is_chinese_slide):
+    """Tighten the comparison target to the final clinch when there's no
+    repeated phrase to count. A shorter target gives partial_ratio a sharper
+    endpoint match (fewer non-matching middle chars dilute the score), which
+    lifts trigger accuracy on plain non-repeating lines. Repeated endings keep
+    the full target so the repetition enforcer can still count loops."""
+    if not target or target_has_repeat(target, is_chinese_slide):
+        return target
+    if is_chinese_slide:
+        # poller already trimmed to last 10 CN chars; the final 6 carry the clinch.
+        return target[-6:] if len(target) > 6 else target
+    # poller already trimmed to last 35 EN chars; tighten to ~25, snapped to a
+    # word boundary so we don't end up matching a partial-word fragment.
+    if len(target) <= 25:
+        return target
+    trimmed = target[-25:]
+    space = trimmed.find(' ')
+    return trimmed[space + 1:].lstrip() if space != -1 else trimmed
+
+
+def render_dashboard():
+    """Build the live rich panel from current globals + ui + poller state."""
+    listening = not is_paused
+    is_chinese = poller.is_chinese_slide if poller else False
+    base_threshold = CN_THRESHOLD if is_chinese else EN_THRESHOLD
+    threshold = base_threshold + 10 if is_slow_mode else base_threshold
+
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column()
+
+    # Row 1: status chips
+    chips = Text()
+    chips.append(" ▶ LISTENING " if listening else " ⏸ PAUSED ",
+                 style="bold white on green" if listening else "bold white on red")
+    chips.append("  ")
+    chips.append(" FAST " if not is_slow_mode else " SLOW ",
+                 style="black on cyan" if not is_slow_mode else "black on yellow")
+    chips.append("  ")
+    chips.append(f" HOLD@END {'ON' if stop_at_section_end else 'OFF'} ",
+                 style="black on magenta" if stop_at_section_end else "dim")
+    chips.append("  ")
+    connected = bool(poller and poller.connected)
+    chips.append("PP7 ●", style="green" if connected else "red")
+    grid.add_row(chips)
+
+    # Row 2: mic + level meter + no-audio watchdog
+    now = time.time()
+    silent_for = (now - ui.last_sound_ts) if ui.last_sound_ts else 999
+    level = min(1.0, ui.input_level / 0.15)
+    bars = int(level * 12)
+    mic = Text()
+    mic.append(f"Mic: {ui.mic_name}  ")
+    mic.append("▰" * bars + "▱" * (12 - bars),
+               style="green" if bars > 0 else "dim")
+    if listening and silent_for > 5:
+        mic.append("  ⚠ NO AUDIO — check mic/source", style="bold white on red")
+    grid.add_row(mic)
+
+    # Row 3: current slide + target (show the tightened target — what we actually match)
+    slide = Text()
+    idx = poller.current_index if poller else -1
+    if poller and 0 <= idx < len(poller.slide_cache):
+        group = poller.slide_cache[idx]['group']
+        target, _ = poller.get_target()
+        listening_for = short_target(target, is_chinese) if target else target
+        slide.append(f"Slide {idx} ", style="bold")
+        slide.append(f"[{group}]  ", style="cyan")
+        slide.append(f"→ …{listening_for}")
+    else:
+        slide.append("No active slide", style="dim")
+    grid.add_row(slide)
+
+    # Row 4: heard + match score
+    lang = "CN/Yue" if is_chinese else "EN"
+    heard = Text()
+    heard.append(f"Heard[{lang}]: ")
+    heard.append(f"{ui.heard or '—':<40} ")
+    if ui.score is not None:
+        heard.append(f"Match {ui.score}%/{threshold}",
+                     style="bold green" if ui.score >= threshold else "yellow")
+    grid.add_row(heard)
+
+    # Row 5: cued + decode latency
+    info = Text()
+    cued_name = None
+    if cued_slide_index is not None and poller and 0 <= cued_slide_index < len(poller.slide_cache):
+        cued_name = poller.slide_cache[cued_slide_index]['group']
+    info.append(f"Cued: {cued_name or '—'}", style="gold1" if cued_name else "dim")
+    info.append("    ")
+    info.append(f"decode ~{ui.decode_ms:.0f} ms",
+                style="red" if ui.decode_ms >= 600 else "dim")
+    grid.add_row(info)
+
+    # Row 6: last action
+    grid.add_row(Text(f"Last: {ui.last_action}", style="dim italic"))
+
+    # Footer: key legend
+    grid.add_row(Text("[/] pause   [;] hold@end   ['] clear cued   [,/.] fast/slow   ←→ slide   ↑↓ song",
+                      style="dim cyan"))
+
+    return Panel(grid, title="PP7 Auto-Lyrics", border_style="blue", padding=(0, 1))
+
+
 def main():
-    global poller, is_paused, is_slow_mode
+    global poller, is_paused, is_slow_mode, live
     p = pyaudio.PyAudio()
-    
+
     print("\n🎤 Available Microphones:")
     for i in range(p.get_device_count()):
         info = p.get_device_info_by_index(i)
         if info.get('maxInputChannels') > 0: print(f"   [{i}] {info.get('name')}")
-            
+
     try: mic_idx = int(input("\n👉 Mic Index (Press Enter for default): "))
     except: mic_idx = None
+
+    # Resolve the device we actually bound to, so the operator can see at a glance
+    # whether macOS quietly rerouted them to the built-in mic instead of the mixer.
+    try:
+        if mic_idx is None:
+            ui.mic_name = p.get_default_input_device_info().get('name', 'System default')
+        else:
+            ui.mic_name = p.get_device_info_by_index(mic_idx).get('name', f'Mic {mic_idx}')
+    except Exception:
+        ui.mic_name = 'System default' if mic_idx is None else f'Mic {mic_idx}'
 
     poller = PP7SmartPoller()
     threading.Thread(target=poller.update_loop, daemon=True).start()
@@ -388,107 +602,129 @@ def main():
     listener.start()
 
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, input_device_index=mic_idx, frames_per_buffer=2048)
-    print("\n✅ System Ready! '/' pause · ';' hold@section-end · ''' clear cued jump")
-    
+    print(f"\n✅ Listening on: {ui.mic_name}\n")
+
     current_slide = -1
-    
     audio_buffer = np.array([], dtype=np.float32)
-    PROCESS_INTERVAL = int(16000 * 0.4) 
-    MAX_BUFFER_SIZE = int(16000 * 8.0)  
+    PROCESS_INTERVAL = int(16000 * 0.4)
+    MAX_BUFFER_SIZE = int(16000 * 8.0)
+    SHORT_BUFFER_SIZE = int(16000 * 4.0)   # faster decode window for non-repeating lines
     samples_since_last_process = 0
+    ui.last_sound_ts = time.time()
 
-    while True:
-        try:
-            target, idx = poller.get_target()
-            is_chinese = poller.is_chinese_slide
+    disable_terminal_echo()
+    with Live(render_dashboard(), console=Console(), refresh_per_second=8, screen=False) as live:
+        while True:
+            try:
+                target, idx = poller.get_target()
+                is_chinese = poller.is_chinese_slide
 
-            if idx == -1 or not target: 
-                time.sleep(0.1)
-                continue
+                if idx == -1 or not target:
+                    live.update(render_dashboard())
+                    time.sleep(0.1)
+                    continue
 
-            if idx != current_slide:
-                current_slide = idx
-                audio_buffer = np.array([], dtype=np.float32) 
-                stream.read(stream.get_read_available(), exception_on_overflow=False)
-                continue
+                if idx != current_slide:
+                    current_slide = idx
+                    audio_buffer = np.array([], dtype=np.float32)
+                    stream.read(stream.get_read_available(), exception_on_overflow=False)
+                    live.update(render_dashboard())
+                    continue
 
-            # We must ALWAYS read from the stream to prevent PyAudio from overflowing
-            data = stream.read(2048, exception_on_overflow=False)
-            
-            # If the user paused the script, throw away the audio and skip processing
-            if is_paused:
-                audio_buffer = np.array([], dtype=np.float32)
-                samples_since_last_process = 0
-                continue
+                # Drain the WHOLE input backlog, not just one fixed chunk. If a decode
+                # ran long and audio piled up in PortAudio, reading a fixed 2048 would
+                # never catch up and latency would grow without bound.
+                avail = stream.get_read_available()
+                nframes = avail if avail > 2048 else 2048
+                data = stream.read(nframes, exception_on_overflow=False)
 
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                # If the user paused the script, throw away the audio and skip processing
+                if is_paused:
+                    audio_buffer = np.array([], dtype=np.float32)
+                    samples_since_last_process = 0
+                    live.update(render_dashboard())
+                    continue
 
-            audio_buffer = np.concatenate((audio_buffer, samples))
-            samples_since_last_process += len(samples)
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            if len(audio_buffer) > MAX_BUFFER_SIZE:
-                audio_buffer = audio_buffer[-MAX_BUFFER_SIZE:]
+                # Input-level watchdog: track RMS so the dashboard can flag a dead mic
+                # (e.g. a silent fallback to an unplugged interface).
+                if len(samples) > 0:
+                    rms = float(np.sqrt(np.mean(samples ** 2)))
+                    ui.input_level = rms
+                    if rms > 0.003:
+                        ui.last_sound_ts = time.time()
 
-            if samples_since_last_process >= PROCESS_INTERVAL:
-                active_engine = rec_sv_cn if is_chinese else rec_sv_en
-                
-                s_stream = active_engine.create_stream()
-                s_stream.accept_waveform(16000, audio_buffer)
-                active_engine.decode_stream(s_stream)
-                result = s_stream.result.text
-                
-                if result:
-                    score, clean_heard = fast_smart_score(result, target, is_chinese)
-                    lang_tag = "CN/Yue" if is_chinese else "EN"
-                    
-                    display_text = clean_heard[-40:] if len(clean_heard) > 40 else clean_heard
-                    sys.stdout.write(f"\r👂 Heard [{lang_tag}]: {display_text:<40} | Match: {score}%   ")
-                    sys.stdout.flush()
+                audio_buffer = np.concatenate((audio_buffer, samples))
+                samples_since_last_process += len(samples)
 
-                    # Adjust thresholds for slow mode
-                    base_threshold = CN_THRESHOLD if is_chinese else EN_THRESHOLD
-                    threshold = base_threshold + 10 if is_slow_mode else base_threshold
-                    
-                    if score >= threshold:
-                        # --- DYNAMIC DELAY LOGIC ---
-                        missing_chars = max(0, len(target) - len(clean_heard))
-                        if missing_chars > 0:
-                            if is_chinese:
-                                if is_slow_mode:
-                                    delay = min(missing_chars * 0.5, 3.5)
+                if len(audio_buffer) > MAX_BUFFER_SIZE:
+                    audio_buffer = audio_buffer[-MAX_BUFFER_SIZE:]
+
+                if samples_since_last_process >= PROCESS_INTERVAL:
+                    active_engine = rec_sv_cn if is_chinese else rec_sv_en
+
+                    # Dynamic decode window: a normal line only needs the last few
+                    # seconds (decodes ~2x faster); repeated endings need the full
+                    # buffer so the repetition enforcer can count loops.
+                    has_repeat = target_has_repeat(target, is_chinese)
+                    decode_max = MAX_BUFFER_SIZE if has_repeat else SHORT_BUFFER_SIZE
+                    decode_buffer = audio_buffer[-decode_max:] if len(audio_buffer) > decode_max else audio_buffer
+
+                    s_stream = active_engine.create_stream()
+                    s_stream.accept_waveform(16000, decode_buffer)
+                    t0 = time.perf_counter()
+                    active_engine.decode_stream(s_stream)
+                    ui.decode_ms = (time.perf_counter() - t0) * 1000
+                    perf_metrics['audio_latency_sum'] += ui.decode_ms
+                    perf_metrics['audio_latency_count'] += 1
+                    result = s_stream.result.text
+
+                    if result:
+                        # Tighten the comparison target on non-repeating lines so
+                        # partial_ratio scores the actual endpoint, not a long tail
+                        # diluted by mid-line content.
+                        score_target = target if has_repeat else short_target(target, is_chinese)
+                        score, clean_heard = fast_smart_score(result, score_target, is_chinese)
+                        ui.heard = clean_heard[-40:] if len(clean_heard) > 40 else clean_heard
+                        ui.score = score
+
+                        # Adjust thresholds for slow mode
+                        base_threshold = CN_THRESHOLD if is_chinese else EN_THRESHOLD
+                        threshold = base_threshold + 10 if is_slow_mode else base_threshold
+
+                        if score >= threshold:
+                            # --- DYNAMIC PRE-TRIGGER DELAY ---
+                            missing_chars = max(0, len(score_target) - len(clean_heard))
+                            if missing_chars > 0:
+                                if is_chinese:
+                                    delay = min(missing_chars * 0.5, 3.5) if is_slow_mode else min(missing_chars * 0.3, 2.5)
+                                    unit = "chars"
                                 else:
-                                    # HEAVY PENALTY: 0.5s per missing Chinese character (up from 0.35s)
-                                    # Cap increased to 2.5 seconds
-                                    delay = min(missing_chars * 0.3, 2.5) 
-                                unit = "chars"
-                            else:
-                                if is_slow_mode:
-                                    delay = min(missing_chars * 0.25, 4.0)
-                                else:
-                                    # HEAVY PENALTY: 0.15s per missing English letter (approx 0.7s per word)
-                                    # Cap increased to 2.5 seconds
-                                    delay = min(missing_chars * 0.15, 2.5) 
-                                unit = "letters"
-                                
-                            sys.stdout.write(f"\r⏱️ Early match ({missing_chars} {unit} left)! Delaying {delay:.1f}s...      ")
-                            sys.stdout.flush()
-                            time.sleep(delay)
+                                    delay = min(missing_chars * 0.25, 4.0) if is_slow_mode else min(missing_chars * 0.15, 2.5)
+                                    unit = "letters"
+                                set_action(f"Early match ({missing_chars} {unit} left) — delaying {delay:.1f}s")
+                                live.update(render_dashboard())
+                                time.sleep(delay)
 
-                        # Trigger the slide
-                        handle_lyric_trigger()
-                        
-                        # 1. Sleep to let the singer finish the line and take a breath
-                        time.sleep(0.8) 
-                        
-                        # 2. CLEAR BUFFERS AFTER SLEEPING (Destroys ghost audio)
-                        audio_buffer = np.array([], dtype=np.float32) 
-                        samples_since_last_process = 0
-                        stream.read(stream.get_read_available(), exception_on_overflow=False)
+                            handle_lyric_trigger()
+                            live.update(render_dashboard())
 
-                samples_since_last_process = 0 
+                            # Let the singer finish the line, then wipe buffers to
+                            # destroy ghost audio before the next slide is scored.
+                            time.sleep(0.8)
+                            audio_buffer = np.array([], dtype=np.float32)
+                            samples_since_last_process = 0
+                            stream.read(stream.get_read_available(), exception_on_overflow=False)
 
-        except KeyboardInterrupt: break
-        except Exception: pass
+                    samples_since_last_process = 0
+
+                live.update(render_dashboard())
+
+            except KeyboardInterrupt: break
+            except Exception: pass
+    restore_terminal_echo()
+
 
 if __name__ == "__main__":
     main()
