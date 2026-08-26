@@ -19,6 +19,10 @@ python PP7_SenseVoice_Only.py
 
 # Optimized version (adds VAD silence-skip + dynamic short/long buffer)
 python PP7_SenseVoice_Optimized.py
+
+# Full-auto version (tracks position across the whole song, not just the current slide)
+python PP7_SenseVoice_FullAuto.py
+python PP7_SenseVoice_FullAuto.py --shadow    # log decisions without driving PP7
 ```
 
 Both scripts prompt for a microphone index at startup (press Enter for default). They require ProPresenter 7 running with **Network enabled on port 1025, no password** (`Settings > Network`).
@@ -69,6 +73,64 @@ Only three meaningful additions over the baseline:
 3. **Longer process interval**: 0.6s vs 0.4s, fewer decode cycles.
 
 The `MAX_BUFFER_SIZE` rolling buffer is still maintained at 8s in both — the difference is what slice gets sent to the decoder.
+
+### Full-auto script (`PP7_SenseVoice_FullAuto.py`)
+
+A **third** standalone script, not a near-duplicate of the other two. It keeps the
+tail-match advance path byte-for-byte identical to the baseline (same thresholds,
+repetition enforcer, and dynamic pre-trigger delay) and adds one independent
+subsystem on top: the **song-wide localizer**. Do not "sync" tuning changes from
+the other two scripts into the localizer, and do not let the advance path here
+drift from the baseline — a field test comparing the scripts is only meaningful
+while that half stays identical.
+
+**What the localizer does.** Every decode cycle it scores the heard transcript
+against *every slide in the presentation* using `rapidfuzz.partial_ratio_alignment`
+(not `thefuzz`, which cannot return an alignment). The alignment gives both a
+similarity score and the character span of the slide the transcript landed on, so
+each candidate carries a `progress` (0..1) saying how far through that slide the
+singer is. Raw `partial_ratio` is corrected by two penalties before ranking:
+`COVERAGE_PENALTY` (the slide explains only part of what we heard — stops a
+two-word slide out-ranking the long line that accounts for the whole buffer) and
+`RECENCY_PENALTY` (the slide matches the *start* of the buffer, so the singer has
+already sung past it).
+
+**Three-legged confidence gate**, all required before anything moves: an absolute
+score floor (`LOCATE_THRESHOLD_*`), a `LOCATE_MARGIN` over the best rival, and
+`VOTE_REQUIRED` **consecutive** agreeing cycles. The votes are consecutive rather
+than a count over the window on purpose — a plain count lets a flapping recogniser
+(A, B, A) reach quorum for A without ever settling. There is a test for this.
+
+**Verbatim-repeated slides** (a chorus printed twice) are found at index-build
+time and grouped in `dup_groups`. They are acoustically indistinguishable, so they
+are excluded from the margin calculation (otherwise a repeated chorus could never
+clear the margin at all) and resolved by position instead — nearest copy, forward
+preferred.
+
+**Actions.** `delta > 1` → absolute jump. `delta == 1` → routed through
+`handle_lyric_trigger(origin="rescue")` rather than calling `/next` directly, so a
+rescue still honours a cued section jump; it is gated on `NEXT_MIN_PROGRESS` so it
+only fires once the singer is audibly *into* the next slide, leaving normal
+end-of-line advances to the tuned tail matcher.
+
+**Operator overrides win.** With hold-at-section-end (`;`) on, full auto degrades
+to auto-*cueing* — it sets `cued_slide_index` and waits for `→` instead of jumping.
+
+**Bilingual decks.** Language is per-slide as elsewhere, but the localizer doesn't
+know where it is, so `plan_languages` decodes the current slide's language every
+cycle and *probes* the other engine every `PROBE_EVERY` cycles (and every cycle
+when lost). A single-language deck never pays for a second decode.
+
+**Field-test instrumentation** is the point of the script, not a nicety: it writes
+`fullauto_events_<date>.jsonl` (one record per decode cycle and decision) alongside
+the usual perf log, and measures **lead time** — how long it had already been sure
+of a slide before the operator moved there by hand. `analyze_fullauto_log.py`
+turns that into the comparison numbers. See `FULLAUTO_FIELD_TEST.md`.
+
+Heavy imports stay at module level to match the other scripts, but the SenseVoice
+engines load inside `main()` rather than at import, so the module can be imported
+for tests. `tests/_fullauto_stubs.py` stubs only genuinely-absent hardware modules,
+so on a real dev machine the real ones are still used.
 
 ## Conventions specific to this codebase
 

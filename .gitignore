@@ -41,3 +41,7 @@ sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
 Icon
 
 Meeting_Transcriber.py
+
+# Session artifacts — these transcribe live service audio, so keep them local
+performance_*.log
+fullauto_events_*.jsonl
