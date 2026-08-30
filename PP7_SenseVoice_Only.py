@@ -52,11 +52,11 @@ HOTKEYS = {
     'u': 'English Verse 1', 'i': 'English Verse 2', 'o': 'English Verse 3', 'p': 'English Verse 4',
     't': 'English Pre-Chorus 1', 'g': 'English Pre-Chorus 2',
     'y': 'English Chorus 1', 'h': 'English Chorus 2',
-    'r': 'English Bridge', 'w': 'English Ending',
+    'r': 'English Bridge', 'q': 'English Ending 1', 'w': 'English Ending 2',
     'v': 'Chinese Verse 1', 'b': 'Chinese Verse 2', 'n': 'Chinese Verse 3', 'm': 'Chinese Verse 4',
     'x': 'Chinese Pre-Chorus 1', 'd': 'Chinese Pre-Chorus 2',
     'c': 'Chinese Chorus 1', 'f': 'Chinese Chorus 2',
-    's': 'Chinese Bridge', 'z': 'Chinese Ending'
+    's': 'Chinese Bridge', 'z': 'Chinese Ending 1', 'a': 'Chinese Ending 2'
 }
 # =================================================
 
@@ -113,6 +113,7 @@ class UIState:
     draws, so a fixed panel never gets corrupted by interleaved thread output."""
     mic_name: str = "—"
     input_level: float = 0.0          # latest chunk RMS (0..~0.3)
+    peak_level: float = 0.02          # decaying max RMS used to scale the meter
     last_sound_ts: float = 0.0        # last time RMS crossed the audible floor
     decode_ms: float = 0.0            # latest SenseVoice decode time
     heard: str = ""                   # latest transcription tail
@@ -517,7 +518,13 @@ def render_dashboard():
     # Row 2: mic + level meter + no-audio watchdog
     now = time.time()
     silent_for = (now - ui.last_sound_ts) if ui.last_sound_ts else 999
-    level = min(1.0, ui.input_level / 0.15)
+    # Frontend-only auto-gain: normalize against the rolling peak and apply a
+    # sqrt curve so quiet speech still fills a visible chunk of the meter.
+    NOISE_FLOOR = 0.005
+    audible = max(0.0, ui.input_level - NOISE_FLOOR)
+    headroom = max(ui.peak_level - NOISE_FLOOR, 0.01)
+    ratio = min(1.0, audible / headroom)
+    level = ratio ** 0.5
     bars = int(level * 12)
     mic = Text()
     mic.append(f"Mic: {ui.mic_name}  ")
@@ -652,6 +659,13 @@ def main():
                 if len(samples) > 0:
                     rms = float(np.sqrt(np.mean(samples ** 2)))
                     ui.input_level = rms
+                    # Decaying rolling peak — meter scales itself to the loudest
+                    # recent input so quiet rooms/loud rooms both look responsive.
+                    # PEAK_MIN floors the scale so silence doesn't make noise-floor
+                    # look "loud" once the peak fully decays.
+                    PEAK_DECAY = 0.995
+                    PEAK_MIN = 0.02
+                    ui.peak_level = max(rms, ui.peak_level * PEAK_DECAY, PEAK_MIN)
                     if rms > 0.003:
                         ui.last_sound_ts = time.time()
 
